@@ -71,6 +71,34 @@ func (g *linearGradient) ColorAt(x, y int) color.Color {
 	return getColor(d, g.stops)
 }
 
+func (g *linearGradient) ColorAt16(x, y int) color.RGBA64 {
+	if len(g.stops) == 0 {
+		return color.RGBA64{}
+	}
+
+	fx, fy := float64(x), float64(y)
+	x0, y0, x1, y1 := g.x0, g.y0, g.x1, g.y1
+	dx, dy := x1-x0, y1-y0
+
+	if dy == 0 && dx != 0 {
+		return getColor16((fx-x0)/dx, g.stops)
+	}
+
+	if dx == 0 && dy != 0 {
+		return getColor16((fy-y0)/dy, g.stops)
+	}
+
+	s0 := dx*(fx-x0) + dy*(fy-y0)
+	if s0 < 0 {
+		return stopColor16(g.stops[0].color)
+	}
+	mag := math.Hypot(dx, dy)
+	u := ((fx-x0)*-dy + (fy-y0)*dx) / (mag * mag)
+	x2, y2 := x0+u*-dy, y0+u*dx
+	d := math.Hypot(fx-x2, fy-y2) / mag
+	return getColor16(d, g.stops)
+}
+
 func (g *linearGradient) AddColorStop(offset float64, color color.Color) {
 	g.stops = append(g.stops, stop{pos: offset, color: color})
 	sort.Sort(g.stops)
@@ -138,6 +166,42 @@ func (g *radialGradient) ColorAt(x, y int) color.Color {
 	return color.Transparent
 }
 
+func (g *radialGradient) ColorAt16(x, y int) color.RGBA64 {
+	if len(g.stops) == 0 {
+		return color.RGBA64{}
+	}
+
+	dx, dy := float64(x)+0.5-g.c0.x, float64(y)+0.5-g.c0.y
+	b := dot3(dx, dy, g.c0.r, g.cd.x, g.cd.y, g.cd.r)
+	c := dot3(dx, dy, -g.c0.r, dx, dy, g.c0.r)
+
+	if g.a == 0 {
+		if b == 0 {
+			return color.RGBA64{}
+		}
+		t := 0.5 * c / b
+		if t*g.cd.r >= g.mindr {
+			return getColor16(t, g.stops)
+		}
+		return color.RGBA64{}
+	}
+
+	discr := dot3(b, g.a, 0, b, -c, 0)
+	if discr >= 0 {
+		sqrtdiscr := math.Sqrt(discr)
+		t0 := (b + sqrtdiscr) * g.inva
+		t1 := (b - sqrtdiscr) * g.inva
+
+		if t0*g.cd.r >= g.mindr {
+			return getColor16(t0, g.stops)
+		} else if t1*g.cd.r >= g.mindr {
+			return getColor16(t1, g.stops)
+		}
+	}
+
+	return color.RGBA64{}
+}
+
 func (g *radialGradient) AddColorStop(offset float64, color color.Color) {
 	g.stops = append(g.stops, stop{pos: offset, color: color})
 	sort.Sort(g.stops)
@@ -181,6 +245,18 @@ func (g *conicGradient) ColorAt(x, y int) color.Color {
 		t += 1
 	}
 	return getColor(t, g.stops)
+}
+
+func (g *conicGradient) ColorAt16(x, y int) color.RGBA64 {
+	if len(g.stops) == 0 {
+		return color.RGBA64{}
+	}
+	a := math.Atan2(float64(y)-g.cy, float64(x)-g.cx)
+	t := norm(a, -math.Pi, math.Pi) - g.rotation
+	if t < 0 {
+		t += 1
+	}
+	return getColor16(t, g.stops)
 }
 
 func (g *conicGradient) AddColorStop(offset float64, color color.Color) {
@@ -229,6 +305,52 @@ func getColor(pos float64, stops stops) color.Color {
 	}
 
 	return last.color
+}
+
+func getColor16(pos float64, stops stops) color.RGBA64 {
+	if pos <= 0.0 || len(stops) == 1 {
+		return stopColor16(stops[0].color)
+	}
+
+	last := stops[len(stops)-1]
+
+	if pos >= last.pos {
+		return stopColor16(last.color)
+	}
+
+	for i, stop := range stops[1:] {
+		if pos < stop.pos {
+			pos = (pos - stops[i].pos) / (stop.pos - stops[i].pos)
+			return colorLerp16(stopColor16(stops[i].color), stopColor16(stop.color), pos)
+		}
+	}
+
+	return stopColor16(last.color)
+}
+
+func stopColor16(c color.Color) color.RGBA64 {
+	r, g, b, a := c.RGBA()
+	return color.RGBA64{uint16(r), uint16(g), uint16(b), uint16(a)}
+}
+
+func colorLerp16(c0, c1 color.RGBA64, t float64) color.RGBA64 {
+	return color.RGBA64{
+		lerp16(uint32(c0.R), uint32(c1.R), t),
+		lerp16(uint32(c0.G), uint32(c1.G), t),
+		lerp16(uint32(c0.B), uint32(c1.B), t),
+		lerp16(uint32(c0.A), uint32(c1.A), t),
+	}
+}
+
+func lerp16(a, b uint32, t float64) uint16 {
+	v := float64(a)*(1.0-t) + float64(b)*t + 0.5
+	if v <= 0 {
+		return 0
+	}
+	if v >= 65535 {
+		return 65535
+	}
+	return uint16(v)
 }
 
 func colorLerp(c0, c1 color.Color, t float64) color.Color {

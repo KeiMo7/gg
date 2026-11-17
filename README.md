@@ -49,7 +49,102 @@ There are a few ways of creating a context.
 NewContext(width, height int) *Context
 NewContextForImage(im image.Image) *Context
 NewContextForRGBA(im *image.RGBA) *Context
+NewContextWithOptions(width, height int, opts RenderOptions) (*Context, error)
+NewContextForImageWithOptions(im image.Image, opts RenderOptions) (*Context, error)
+NewContextForImage10(im *Image10) *Context
+NewContextForYUV420P10LE(y, u, v []uint16, width, height int, opts YUV420P10LEOptions) (*Context, error)
 ```
+
+## 10-bit Output
+
+The legacy `NewContext`, `NewContextForImage`, and `NewContextForRGBA` paths keep
+their 8-bit RGBA behavior. A zero-value `RenderOptions` also selects the legacy
+path for blank canvases. Existing callers therefore see the same pixels,
+return values, panics, and log output unless they explicitly opt in or pass a
+source image with more than 8 bits.
+
+Use an explicit 10-bit context when the output must remain high depth:
+
+```go
+dc, err := gg.NewContextWithOptions(width, height, gg.RenderOptions{
+    BitDepth: gg.BitDepth10,
+    Dither:   gg.DitherOrdered,
+    Logger:   logger, // nil keeps the legacy silent behavior
+})
+if err != nil {
+    return err
+}
+```
+
+`Image10` stores alpha-premultiplied samples in the range 0..1023. It is the
+no-copy input type for direct 10-bit work:
+
+```go
+src := gg.NewImage10Rect(width, height)
+src.SetRGBA10(x, y, r10, g10, b10, 1023)
+dc := gg.NewContextForImage10(src)
+if err := dc.SavePNG("out.png"); err != nil {
+    return err
+}
+```
+
+Migration from the existing 8-bit constructor is opt-in:
+
+```go
+// Before: legacy 8-bit context.
+dc := gg.NewContextForImage(src)
+
+// After: keep 8-bit sources at 8 bits by default, or request 10 bits
+// explicitly without changing unrelated call sites.
+dc10, err := gg.NewContextForImageWithOptions(src, gg.RenderOptions{
+    BitDepth: gg.BitDepth10,
+    Dither:   gg.DitherOrdered,
+})
+```
+
+For a mixed batch, construct one context per item. Depth selection is
+per-item; there is no batch-wide minimum:
+
+```go
+for _, item := range items {
+    dc, err := gg.NewContextForImageWithOptions(item, gg.RenderOptions{
+        Dither: gg.DitherOrdered,
+    })
+    // 8-bit item -> 8-bit context; 10-bit item -> 10-bit context.
+}
+```
+
+PNG output uses a 16-bit container for the 10-bit samples. JPEG is rejected
+without writing a file because it cannot represent the target depth. A raw
+`yuv420p10le` frame can be produced explicitly; muxing into MP4 or another
+container remains the caller's responsibility:
+
+```go
+err := dc.Save("frame.yuv", gg.EncodeOptions{
+    Format: gg.FormatYUV420P10LE,
+    Matrix: gg.YUVMatrixBT709,
+})
+```
+
+Bit-depth decisions are logged only when `RenderOptions.Logger` is set. The
+stable fields are `level`, `decision`, and either `enter`, `exit`, or `fail`.
+For example:
+
+```text
+gg: level=debug decision=context_from_image enter format=*image.RGBA source_bit_depth=8 requested_bit_depth=0
+gg: level=debug decision=context_from_image exit source_bit_depth=8 target_bit_depth=8 dither=none
+gg: level=error decision=encode fail format=jpeg bit_depth=10 error="..."
+```
+
+`Context` remains non-thread-safe, matching the existing API. Separate
+contexts, including 10-bit contexts, can be rendered concurrently. The ordered
+dither table is read-only, so `go test -race` is the verification path.
+
+Current boundaries: target depths are 8 and 10 only; PNG is the supported
+high-depth still-image encoder; YUV covers 4:2:0 planar input/output with
+BT.709/BT.601 matrices; and container muxing is intentionally out of scope.
+Future depth expansion should start in `bitdepth.go` (depth selection),
+`pattern10.go` (compositing), and `yuv.go` (pixel-format conversion).
 
 ## Drawing Functions
 

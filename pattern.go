@@ -20,6 +20,13 @@ type Pattern interface {
 	ColorAt(x, y int) color.Color
 }
 
+// HighDepthPattern is an optional interface for patterns that can provide
+// colors without first quantizing them to 8 bits.
+type HighDepthPattern interface {
+	Pattern
+	ColorAt16(x, y int) color.RGBA64
+}
+
 // Solid Pattern
 type solidPattern struct {
 	color color.Color
@@ -27,6 +34,10 @@ type solidPattern struct {
 
 func (p *solidPattern) ColorAt(x, y int) color.Color {
 	return p.color
+}
+
+func (p *solidPattern) ColorAt16(x, y int) color.RGBA64 {
+	return color.RGBA64Model.Convert(p.color).(color.RGBA64)
 }
 
 func NewSolidPattern(color color.Color) Pattern {
@@ -58,6 +69,10 @@ func (p *surfacePattern) ColorAt(x, y int) color.Color {
 	x = x%b.Dx() + b.Min.X
 	y = y%b.Dy() + b.Min.Y
 	return p.im.At(x, y)
+}
+
+func (p *surfacePattern) ColorAt16(x, y int) color.RGBA64 {
+	return color.RGBA64Model.Convert(p.ColorAt(x, y)).(color.RGBA64)
 }
 
 func NewSurfacePattern(im image.Image, op RepeatOp) Pattern {

@@ -8,6 +8,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"log"
 	"math"
 	"strings"
 
@@ -58,7 +59,14 @@ type Context struct {
 	height        int
 	rasterizer    *raster.Rasterizer
 	im            *image.RGBA
+	im10          *Image10
 	mask          *image.Alpha
+	mask16        *image.Alpha16
+	bitDepth      int
+	sourceDepth   int
+	sourceFormat  string
+	dither        DitherMode
+	logger        *log.Logger
 	color         color.Color
 	fillPattern   Pattern
 	strokePattern Pattern
@@ -85,10 +93,138 @@ func NewContext(width, height int) *Context {
 	return NewContextForRGBA(image.NewRGBA(image.Rect(0, 0, width, height)))
 }
 
-// NewContextForImage copies the specified image into a new image.RGBA
-// and prepares a context for rendering onto that image.
+// NewContextForImage copies the specified image and prepares a context for
+// rendering onto that image. Legacy 8-bit sources retain the original RGBA
+// path; higher-depth sources enable the 10-bit path.
 func NewContextForImage(im image.Image) *Context {
-	return NewContextForRGBA(imageToRGBA(im))
+	if sourceBitDepthOf(im) <= BitDepth8 {
+		return NewContextForRGBA(imageToRGBA(im))
+	}
+	dc, err := NewContextForImageWithOptions(im, RenderOptions{})
+	if err != nil {
+		panic(err)
+	}
+	return dc
+}
+
+// NewContextWithOptions creates a blank rendering context. A zero BitDepth
+// keeps the legacy 8-bit behavior.
+func NewContextWithOptions(width, height int, opts RenderOptions) (*Context, error) {
+	logBitDepthDecision(opts.Logger, "debug", "context_create",
+		"enter width=%d height=%d requested_bit_depth=%d", width, height, opts.BitDepth)
+	if err := validateTargetBitDepth(opts.BitDepth); err != nil {
+		logBitDepthDecision(opts.Logger, "error", "context_create", "fail error=%q", err)
+		return nil, err
+	}
+	if err := validateDitherMode(opts.Dither); err != nil {
+		logBitDepthDecision(opts.Logger, "error", "context_create", "fail error=%q", err)
+		return nil, err
+	}
+	depth := opts.BitDepth
+	if depth == 0 {
+		depth = BitDepth8
+	}
+	var dc *Context
+	if depth == BitDepth10 {
+		dc = newContextForImage10(NewImage10(image.Rect(0, 0, width, height)))
+	} else {
+		dc = NewContextForRGBA(image.NewRGBA(image.Rect(0, 0, width, height)))
+	}
+	dc.dither = opts.Dither
+	dc.logger = opts.Logger
+	logBitDepthDecision(opts.Logger, "debug", "context_create",
+		"exit bit_depth=%d dither=%s", dc.bitDepth, dc.dither)
+	return dc, nil
+}
+
+// NewContextForImageWithOptions copies an image into a context using the
+// requested target depth. Automatic mode selects 10-bit for high-depth
+// sources and the unchanged 8-bit path for legacy sources.
+func NewContextForImageWithOptions(im image.Image, opts RenderOptions) (*Context, error) {
+	sourceDepth := sourceBitDepthOf(im)
+	logBitDepthDecision(opts.Logger, "debug", "context_from_image",
+		"enter format=%s source_bit_depth=%d requested_bit_depth=%d",
+		sourceFormatOf(im), sourceDepth, opts.BitDepth)
+	if im == nil {
+		err := errors.New("gg: cannot create a context from a nil image")
+		logBitDepthDecision(opts.Logger, "error", "context_from_image", "fail error=%q", err)
+		return nil, err
+	}
+	if err := validateTargetBitDepth(opts.BitDepth); err != nil {
+		logBitDepthDecision(opts.Logger, "error", "context_from_image", "fail error=%q", err)
+		return nil, err
+	}
+	if err := validateDitherMode(opts.Dither); err != nil {
+		logBitDepthDecision(opts.Logger, "error", "context_from_image", "fail error=%q", err)
+		return nil, err
+	}
+	declaredDepth := opts.SourceBitDepth
+	if declaredDepth == 0 {
+		declaredDepth = sourceDepth
+	}
+	if err := ValidateBitDepth(im, declaredDepth); err != nil {
+		logBitDepthDecision(opts.Logger, "error", "context_from_image",
+			"fail declared_bit_depth=%d error=%q", declaredDepth, err)
+		return nil, err
+	}
+
+	targetDepth := effectiveTargetBitDepth(sourceDepth, opts.BitDepth)
+	var dc *Context
+	if targetDepth == BitDepth10 {
+		var dst *Image10
+		if src, ok := im.(*Image10); ok {
+			dst = copyImage10(src)
+		} else {
+			dst = imageToImage10(im, opts.Dither)
+		}
+		dc = newContextForImage10(dst)
+	} else {
+		dc = NewContextForRGBA(imageToRGBA(im))
+	}
+	dc.sourceDepth = sourceDepth
+	dc.sourceFormat = sourceFormatOf(im)
+	dc.dither = opts.Dither
+	dc.logger = opts.Logger
+	logBitDepthDecision(opts.Logger, "debug", "context_from_image",
+		"exit source_bit_depth=%d target_bit_depth=%d dither=%s",
+		sourceDepth, dc.bitDepth, dc.dither)
+	return dc, nil
+}
+
+// NewContextForImage10 prepares a context for rendering onto the specified
+// 10-bit image. No copy is made.
+func NewContextForImage10(im *Image10) *Context {
+	dc := newContextForImage10(im)
+	dc.sourceDepth = BitDepth10
+	dc.sourceFormat = sourceFormatOf(im)
+	return dc
+}
+
+// NewContextForRGBA10 is an alias for NewContextForImage10.
+func NewContextForRGBA10(im *Image10) *Context {
+	return NewContextForImage10(im)
+}
+
+func newContextForImage10(im *Image10) *Context {
+	w := im.Bounds().Size().X
+	h := im.Bounds().Size().Y
+	return &Context{
+		width:         w,
+		height:        h,
+		rasterizer:    raster.NewRasterizer(w, h),
+		im10:          im,
+		bitDepth:      BitDepth10,
+		sourceDepth:   BitDepth10,
+		dither:        DitherNone,
+		color:         color.Transparent,
+		fillPattern:   defaultFillStyle,
+		strokePattern: defaultStrokeStyle,
+		lineWidth:     1,
+		fillRule:      FillRuleWinding,
+		fontFace:      basicfont.Face7x13,
+		fontHeight:    13,
+		matrix:        Identity(),
+	}
 }
 
 // NewContextForRGBA prepares a context for rendering onto the specified image.
@@ -101,6 +237,9 @@ func NewContextForRGBA(im *image.RGBA) *Context {
 		height:        h,
 		rasterizer:    raster.NewRasterizer(w, h),
 		im:            im,
+		bitDepth:      BitDepth8,
+		sourceDepth:   BitDepth8,
+		dither:        DitherNone,
 		color:         color.Transparent,
 		fillPattern:   defaultFillStyle,
 		strokePattern: defaultStrokeStyle,
@@ -123,7 +262,37 @@ func (dc *Context) GetCurrentPoint() (Point, bool) {
 
 // Image returns the image that has been drawn by this context.
 func (dc *Context) Image() image.Image {
+	if dc.im10 != nil {
+		return dc.im10
+	}
 	return dc.im
+}
+
+// Image10 returns the 10-bit image backing this context, or nil for the
+// legacy 8-bit path.
+func (dc *Context) Image10() *Image10 {
+	return dc.im10
+}
+
+// BitDepth returns the effective bit depth of the rendering target.
+func (dc *Context) BitDepth() int {
+	if dc.bitDepth == 0 {
+		return BitDepth8
+	}
+	return dc.bitDepth
+}
+
+// SourceBitDepth returns the inferred or declared source bit depth.
+func (dc *Context) SourceBitDepth() int {
+	if dc.sourceDepth == 0 {
+		return BitDepth8
+	}
+	return dc.sourceDepth
+}
+
+// Dither returns the configured quantization strategy.
+func (dc *Context) Dither() DitherMode {
+	return dc.dither
 }
 
 // Width returns the width of the image in pixels.
@@ -138,16 +307,25 @@ func (dc *Context) Height() int {
 
 // SavePNG encodes the image as a PNG and writes it to disk.
 func (dc *Context) SavePNG(path string) error {
+	if dc.im10 != nil {
+		return savePNGAtomic(path, dc.im10)
+	}
 	return SavePNG(path, dc.im)
 }
 
 // SaveJPG encodes the image as a JPG and writes it to disk.
 func (dc *Context) SaveJPG(path string, quality int) error {
+	if dc.im10 != nil {
+		return newUnsupportedJPEGError(BitDepth10)
+	}
 	return SaveJPG(path, dc.im, quality)
 }
 
 // EncodePNG encodes the image as a PNG and writes it to the provided io.Writer.
 func (dc *Context) EncodePNG(w io.Writer) error {
+	if dc.im10 != nil {
+		return png.Encode(w, dc.im10)
+	}
 	return png.Encode(w, dc.im)
 }
 
@@ -155,6 +333,9 @@ func (dc *Context) EncodePNG(w io.Writer) error {
 // in JPEG 4:2:0 baseline format with the given options.
 // Default parameters are used if a nil *jpeg.Options is passed.
 func (dc *Context) EncodeJPG(w io.Writer, o *jpeg.Options) error {
+	if dc.im10 != nil {
+		return newUnsupportedJPEGError(BitDepth10)
+	}
 	return jpeg.Encode(w, dc.im, o)
 }
 
@@ -273,6 +454,23 @@ func (dc *Context) SetRGBA(r, g, b, a float64) {
 		uint8(a * 255),
 	}
 	dc.setFillAndStrokeColor(dc.color)
+}
+
+// SetRGBA10 sets the current color from 10-bit components. Values above 1023
+// are clamped.
+func (dc *Context) SetRGBA10(r, g, b, a uint16) {
+	dc.color = color.NRGBA64{
+		R: expand10To16(clamp10(r)),
+		G: expand10To16(clamp10(g)),
+		B: expand10To16(clamp10(b)),
+		A: expand10To16(clamp10(a)),
+	}
+	dc.setFillAndStrokeColor(dc.color)
+}
+
+// SetRGB10 sets the current color from 10-bit components with full alpha.
+func (dc *Context) SetRGB10(r, g, b uint16) {
+	dc.SetRGBA10(r, g, b, 1023)
 }
 
 // SetRGB sets the current color. r, g, b values should be between 0 and 1,
@@ -440,6 +638,13 @@ func (dc *Context) fill(painter raster.Painter) {
 // line cap, line join and dash settings. The path is preserved after this
 // operation.
 func (dc *Context) StrokePreserve() {
+	if dc.im10 != nil {
+		dc.logBitDepth("debug", "paint", "enter operation=stroke bit_depth=%d", dc.bitDepth)
+		painter := newPatternPainter10(dc.im10, dc.mask16, dc.strokePattern, dc.dither)
+		dc.stroke(painter)
+		dc.logBitDepth("debug", "paint", "exit operation=stroke bit_depth=%d", dc.bitDepth)
+		return
+	}
 	var painter raster.Painter
 	if dc.mask == nil {
 		if pattern, ok := dc.strokePattern.(*solidPattern); ok {
@@ -467,6 +672,13 @@ func (dc *Context) Stroke() {
 // FillPreserve fills the current path with the current color. Open subpaths
 // are implicity closed. The path is preserved after this operation.
 func (dc *Context) FillPreserve() {
+	if dc.im10 != nil {
+		dc.logBitDepth("debug", "paint", "enter operation=fill bit_depth=%d", dc.bitDepth)
+		painter := newPatternPainter10(dc.im10, dc.mask16, dc.fillPattern, dc.dither)
+		dc.fill(painter)
+		dc.logBitDepth("debug", "paint", "exit operation=fill bit_depth=%d", dc.bitDepth)
+		return
+	}
 	var painter raster.Painter
 	if dc.mask == nil {
 		if pattern, ok := dc.fillPattern.(*solidPattern); ok {
@@ -494,6 +706,18 @@ func (dc *Context) Fill() {
 // clipping region with the current path as it would be filled by dc.Fill().
 // The path is preserved after this operation.
 func (dc *Context) ClipPreserve() {
+	if dc.im10 != nil {
+		dc.logBitDepth("debug", "clip", "enter operation=clip bit_depth=%d", dc.bitDepth)
+		clip := image.NewAlpha16(image.Rect(0, 0, dc.width, dc.height))
+		dc.fill(newAlphaPainter16(clip))
+		if dc.mask16 == nil {
+			dc.mask16 = clip
+		} else {
+			combineAlpha16(dc.mask16, clip)
+		}
+		dc.logBitDepth("debug", "clip", "exit operation=clip bit_depth=%d", dc.bitDepth)
+		return
+	}
 	clip := image.NewAlpha(image.Rect(0, 0, dc.width, dc.height))
 	painter := raster.NewAlphaOverPainter(clip)
 	dc.fill(painter)
@@ -510,10 +734,43 @@ func (dc *Context) ClipPreserve() {
 // mask. It must be the same size as the context, else an error is returned
 // and the mask is unchanged.
 func (dc *Context) SetMask(mask *image.Alpha) error {
-	if mask.Bounds().Size() != dc.im.Bounds().Size() {
+	if mask.Bounds().Size() != dc.Image().Bounds().Size() {
 		return errors.New("mask size must match context size")
 	}
+	if dc.im10 != nil {
+		mask16 := image.NewAlpha16(mask.Bounds())
+		for y := mask.Bounds().Min.Y; y < mask.Bounds().Max.Y; y++ {
+			for x := mask.Bounds().Min.X; x < mask.Bounds().Max.X; x++ {
+				mask16.SetAlpha16(x, y, color.Alpha16{A: uint16(mask.AlphaAt(x, y).A) * 0x101})
+			}
+		}
+		dc.mask16 = mask16
+		dc.mask = nil
+		return nil
+	}
 	dc.mask = mask
+	dc.mask16 = nil
+	return nil
+}
+
+// SetMask16 allows a 16-bit clipping mask to be used by the 10-bit path.
+func (dc *Context) SetMask16(mask *image.Alpha16) error {
+	if mask.Bounds().Size() != dc.Image().Bounds().Size() {
+		return errors.New("mask size must match context size")
+	}
+	if dc.im10 != nil {
+		dc.mask16 = mask
+		dc.mask = nil
+		return nil
+	}
+	mask8 := image.NewAlpha(mask.Bounds())
+	for y := mask.Bounds().Min.Y; y < mask.Bounds().Max.Y; y++ {
+		for x := mask.Bounds().Min.X; x < mask.Bounds().Max.X; x++ {
+			mask8.SetAlpha(x, y, color.Alpha{A: uint8(mask.Alpha16At(x, y).A >> 8)})
+		}
+	}
+	dc.mask = mask8
+	dc.mask16 = nil
 	return nil
 }
 
@@ -521,14 +778,46 @@ func (dc *Context) SetMask(mask *image.Alpha) error {
 // context. This can be useful for advanced clipping operations where you first
 // render the mask geometry and then use it as a mask.
 func (dc *Context) AsMask() *image.Alpha {
+	if dc.im10 != nil {
+		mask := image.NewAlpha(dc.im10.Bounds())
+		for y := mask.Bounds().Min.Y; y < mask.Bounds().Max.Y; y++ {
+			for x := mask.Bounds().Min.X; x < mask.Bounds().Max.X; x++ {
+				_, _, _, a := dc.im10.RGBA10At(x, y)
+				mask.SetAlpha(x, y, color.Alpha{A: uint8(a >> 2)})
+			}
+		}
+		return mask
+	}
 	mask := image.NewAlpha(dc.im.Bounds())
 	draw.Draw(mask, dc.im.Bounds(), dc.im, image.ZP, draw.Src)
+	return mask
+}
+
+// AsMask16 returns a 16-bit alpha mask for both rendering paths.
+func (dc *Context) AsMask16() *image.Alpha16 {
+	mask := image.NewAlpha16(dc.Image().Bounds())
+	for y := mask.Bounds().Min.Y; y < mask.Bounds().Max.Y; y++ {
+		for x := mask.Bounds().Min.X; x < mask.Bounds().Max.X; x++ {
+			_, _, _, a := dc.Image().At(x, y).RGBA()
+			mask.SetAlpha16(x, y, color.Alpha16{A: uint16(a)})
+		}
+	}
 	return mask
 }
 
 // InvertMask inverts the alpha values in the current clipping mask such that
 // a fully transparent region becomes fully opaque and vice versa.
 func (dc *Context) InvertMask() {
+	if dc.im10 != nil {
+		if dc.mask16 == nil {
+			dc.mask16 = image.NewAlpha16(dc.im10.Bounds())
+		} else {
+			for i, a := range dc.mask16.Pix {
+				dc.mask16.Pix[i] = 255 - a
+			}
+		}
+		return
+	}
 	if dc.mask == nil {
 		dc.mask = image.NewAlpha(dc.im.Bounds())
 	} else {
@@ -555,12 +844,30 @@ func (dc *Context) ResetClip() {
 
 // Clear fills the entire image with the current color.
 func (dc *Context) Clear() {
+	if dc.im10 != nil {
+		r, g, b, a := dc.color.RGBA()
+		for y := dc.im10.Rect.Min.Y; y < dc.im10.Rect.Max.Y; y++ {
+			for x := dc.im10.Rect.Min.X; x < dc.im10.Rect.Max.X; x++ {
+				dc.im10.SetRGBA10(x, y,
+					quantize16To10(r, dc.dither, x, y),
+					quantize16To10(g, dc.dither, x, y),
+					quantize16To10(b, dc.dither, x, y),
+					quantize16To10(a, dc.dither, x, y),
+				)
+			}
+		}
+		return
+	}
 	src := image.NewUniform(dc.color)
 	draw.Draw(dc.im, dc.im.Bounds(), src, image.ZP, draw.Src)
 }
 
 // SetPixel sets the color of the specified pixel using the current color.
 func (dc *Context) SetPixel(x, y int) {
+	if dc.im10 != nil {
+		dc.im10.Set(x, y, dc.color)
+		return
+	}
 	dc.im.Set(x, y, dc.color)
 }
 
@@ -677,6 +984,17 @@ func (dc *Context) DrawImageAnchored(im image.Image, x, y int, ax, ay float64) {
 	fx, fy := float64(x), float64(y)
 	m := dc.matrix.Translate(fx, fy)
 	s2d := f64.Aff3{m.XX, m.XY, m.X0, m.YX, m.YY, m.Y0}
+	if dc.im10 != nil {
+		if dc.mask16 == nil {
+			transformer.Transform(dc.im10, s2d, im, im.Bounds(), draw.Over, nil)
+		} else {
+			transformer.Transform(dc.im10, s2d, im, im.Bounds(), draw.Over, &draw.Options{
+				DstMask:  dc.mask16,
+				DstMaskP: image.ZP,
+			})
+		}
+		return
+	}
 	if dc.mask == nil {
 		transformer.Transform(dc.im, s2d, im, im.Bounds(), draw.Over, nil)
 	} else {
@@ -707,7 +1025,7 @@ func (dc *Context) FontHeight() float64 {
 	return dc.fontHeight
 }
 
-func (dc *Context) drawString(im *image.RGBA, s string, x, y float64) {
+func (dc *Context) drawString(im draw.Image, s string, x, y float64) {
 	d := &font.Drawer{
 		Dst:  im,
 		Src:  image.NewUniform(dc.color),
@@ -753,6 +1071,16 @@ func (dc *Context) DrawStringAnchored(s string, x, y, ax, ay float64) {
 	w, h := dc.MeasureString(s)
 	x -= ax * w
 	y += ay * h
+	if dc.im10 != nil {
+		if dc.mask16 == nil {
+			dc.drawString(dc.im10, s, x, y)
+		} else {
+			im := NewImage10(image.Rect(0, 0, dc.width, dc.height))
+			dc.drawString(im, s, x, y)
+			draw.DrawMask(dc.im10, dc.im10.Bounds(), im, image.ZP, dc.mask16, image.ZP, draw.Over)
+		}
+		return
+	}
 	if dc.mask == nil {
 		dc.drawString(dc.im, s, x, y)
 	} else {
@@ -914,6 +1242,7 @@ func (dc *Context) Pop() {
 	x, s := s[len(s)-1], s[:len(s)-1]
 	*dc = *x
 	dc.mask = before.mask
+	dc.mask16 = before.mask16
 	dc.strokePath = before.strokePath
 	dc.fillPath = before.fillPath
 	dc.start = before.start
